@@ -883,6 +883,7 @@ pub fn test_process_blockstore(
         None,
         None,
         exit.clone(),
+        false,
     )
     .unwrap();
 
