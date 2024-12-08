@@ -42,6 +42,7 @@ main() {
 
     # Replace active binaries
     printf "Replacing active binaries...\n"
+    sudo mkdir -p "$ACTIVE_DIR"
     sudo rm -rf "$ACTIVE_DIR"
     sudo cp -r "$INSTALL_DIR/bin/" "$ACTIVE_DIR"
 
