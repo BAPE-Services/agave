@@ -2,7 +2,9 @@
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
 use {
-    agave_validator::{
+    // FIREDANCER: We have inverted the dependency, so the library depends on main.rs so that this
+    // import now just needs to refer to the crate.
+    crate::{
         admin_rpc_service,
         admin_rpc_service::{load_staked_nodes_overrides, StakedNodesOverrides},
         bootstrap,
@@ -462,11 +464,19 @@ fn configure_banking_trace_dir_byte_limit(
     };
 }
 
-pub fn main() {
+// FIREDANCER: Switch main to be a function that takes arguments, rather than
+// an actual entrypoint for the binary.
+pub fn main<I, T>(itr: I)
+where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone {
+    let args: Vec<std::ffi::OsString> = itr.into_iter().map(|x| x.into()).collect();
+
     let default_args = DefaultArgs::new();
     let solana_version = solana_version::version!();
     let cli_app = app(solana_version, &default_args);
-    let matches = cli_app.get_matches();
+    // FIREDANCER: Parse matches from the provided arguments rather than env_os()
+    let matches = cli_app.get_matches_from(&args);
     warn_for_deprecated_arguments(&matches);
 
     let socket_addr_space = SocketAddrSpace::new(matches.is_present("allow_private_addr"));
@@ -943,10 +953,82 @@ pub fn main() {
         }
     };
     let use_progress_bar = logfile.is_none();
-    let _logger_thread = redirect_stderr_to_file(logfile);
+    // FIREDANCER: Redirect logging to Firedancer
+    // let _logger_thread = redirect_stderr_to_file(logfile);
+    let _ = redirect_stderr_to_file; // Silence unused warning
+    extern "C" {
+        fn fd_log_private_1(level: i32, now: i64, file: *const i8, line: i32, func: *const i8, msg: *const i8);
+        fn fd_log_wallclock() -> i64;
+        fn fd_log_level_logfile() -> i32;
+    }
+
+    struct FDLogger {}
+
+    impl log::Log for FDLogger {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            match metadata.level() {
+                log::Level::Error | log::Level::Warn | log::Level::Info => true,
+                log::Level::Debug | log::Level::Trace => false,
+            }
+        }
+    
+        fn log(&self, record: &log::Record) {
+            match record.level() {
+                log::Level::Error | log::Level::Warn | log::Level::Info => (),
+                log::Level::Debug | log::Level::Trace => return,
+            };
+
+            let level: i32 = match record.level() {
+                log::Level::Error => 4,
+                log::Level::Warn => 3,
+                log::Level::Info => 1, /* Info -> DEBUG, so it doesn't spam stdout */
+                log::Level::Debug => 1,
+                log::Level::Trace => 0,
+            };
+    
+            const UNKNOWN: &'static str = "unknown";
+    
+            let file = if let Some(file) = record.file() {
+                std::ffi::CString::new(file).unwrap_or(std::ffi::CString::new(UNKNOWN).unwrap())
+            } else {
+                std::ffi::CString::new(UNKNOWN).unwrap()
+            };
+    
+            let msg = std::ffi::CString::new(record.args().to_string()).unwrap_or(std::ffi::CString::new(UNKNOWN).unwrap());
+            let target = std::ffi::CString::new(record.target()).unwrap_or(std::ffi::CString::new(UNKNOWN).unwrap());
+
+            unsafe {
+                // We reroute log messages to the Firedancer logger.
+                // There are a few problems with this.  The message should be
+                // printed into the target buffer, rather than a heap
+                // allocated string. None the less, it's good enough for now.
+                fd_log_private_1(
+                    level,
+                    fd_log_wallclock(),
+                    file.as_ptr(),
+                    record.line().unwrap_or(0) as i32,
+                    target.as_ptr(),
+                    msg.as_ptr());
+            }
+        }
+    
+        fn flush(&self) {}
+    }
+    let _logger_thread: Option<std::thread::JoinHandle<()>> = None;
+    static LOGGER: FDLogger = FDLogger {};
+    let log_level = match unsafe { fd_log_level_logfile() } {
+        0 => LevelFilter::Trace,
+        1 => LevelFilter::Debug,
+        2 => LevelFilter::Info,
+        3 => LevelFilter::Warn,
+        4 => LevelFilter::Error,
+        _ => LevelFilter::Off,
+    };
+    log::set_logger(&LOGGER).map(|()| log::set_max_level(log_level)).unwrap();
 
     info!("{} {}", crate_name!(), solana_version);
-    info!("Starting validator with: {:#?}", std::env::args_os());
+    // FIREDANCER: Dump provided arguments rather than ones from the environment
+    info!("Starting validator with: {:#?}", args);
 
     let cuda = matches.is_present("cuda");
     if cuda {
@@ -1877,7 +1959,7 @@ pub fn main() {
     let mut ledger_lock = ledger_lockfile(&ledger_path);
     let _ledger_write_guard = lock_ledger(&ledger_path, &mut ledger_lock);
 
-    let start_progress = Arc::new(RwLock::new(ValidatorStartProgress::default()));
+    let start_progress = Arc::new(solana_core::validator::VSPRwLock::new());
     let admin_service_post_init = Arc::new(RwLock::new(None));
     let (rpc_to_plugin_manager_sender, rpc_to_plugin_manager_receiver) =
         if starting_with_geyser_plugins {
@@ -1985,7 +2067,28 @@ pub fn main() {
         .map(ContactInfo::new_gossip_entry_point)
         .collect::<Vec<_>>();
 
-    let mut node = Node::new_with_external_ip(&identity_keypair.pubkey(), node_config);
+    // FIREDANCER: Get application ports from the CLI.
+    let firedancer_tpu_port = value_t_or_exit!(matches, "firedancer_tpu_port", u16);
+    let firedancer_tvu_port = value_t_or_exit!(matches, "firedancer_tvu_port", u16);
+
+    // FIREDANCER: Send shred version that we retrieved from the command line or the entrypoint above to Firedancer
+    if let Some(shred_version) = expected_shred_version {
+        extern "C" {
+            fn fd_ext_shred_set_shred_version( shred_version: u64 );
+        }
+        unsafe { fd_ext_shred_set_shred_version(shred_version as u64) };
+    }
+
+    let mut node = Node::new_with_external_ip(
+        &identity_keypair.pubkey(),
+        node_config,
+        // FIREDANCER: Desired port for the TPU is passed in from the config file, so it
+        // can be broadcast correctly via. gossip.
+        firedancer_tpu_port,
+        // FIREDANCER: Desired port for the TVU is passed in from the config file, so it
+        // can be broadcast correctly via. gossip.
+        firedancer_tvu_port,
+    );
 
     if restricted_repair_only_mode {
         if validator_config.wen_restart_proto_path.is_some() {

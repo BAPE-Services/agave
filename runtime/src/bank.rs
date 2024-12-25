@@ -212,6 +212,70 @@ use {
     solana_system_program::{get_system_account_kind, SystemAccountKind},
 };
 
+/// FIREDANCER: Make sure SanitizedTransaction ABI doesn't change. This
+/// doesn't really check it properly, but it's better than nothing.
+const _CHECK_ABI: [u8; 248] = [0; std::mem::size_of::<SanitizedTransaction>()];
+
+
+#[no_mangle]
+pub extern "C" fn fd_ext_bank_load_account( bank: *const std::ffi::c_void, with_fixed_root: i32, addr: *const u8, out_owner: *mut u8, out_data: *mut u8, out_data_sz: *mut u64 ) -> i32 {
+    let bank = bank as *const Bank;
+    unsafe { Arc::increment_strong_count(bank) };
+
+    let loader = if with_fixed_root == 0 {
+        Accounts::load_with_fixed_root
+    } else {
+        Accounts::load_without_fixed_root
+    };
+
+    let bank = unsafe { Arc::from_raw( bank as *const Bank ) };
+    loader(&bank.rc.accounts, &bank.ancestors, unsafe { &*(addr as *const Pubkey) })
+        .map(|(account, _)| {
+            unsafe {
+                std::ptr::copy_nonoverlapping(account.owner().as_ref().as_ptr(), out_owner, 32);
+
+                let out_sz = usize::min(account.data().len(), *out_data_sz as usize);
+                std::ptr::copy_nonoverlapping(account.data().as_ptr(), out_data, out_sz);
+                *out_data_sz = out_sz as u64;
+            }
+            0
+        })
+        .unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn fd_ext_bank_verify_precompiles( bank: *const std::ffi::c_void, txn: *const std::ffi::c_void ) -> i32 {
+    let txn: &SanitizedTransaction = unsafe {
+        &*(txn as *const SanitizedTransaction)
+    };
+    let bank = bank as *const Bank;
+    unsafe { Arc::increment_strong_count(bank) };
+    let bank = unsafe { Arc::from_raw( bank as *const Bank ) };
+
+    match txn.verify_precompiles(&bank.feature_set) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fd_ext_bank_acquire( bank: *const std::ffi::c_void ) {
+    let bank = bank as *const Bank;
+    unsafe { Arc::increment_strong_count(bank) };
+}
+
+#[no_mangle]
+pub extern "C" fn fd_ext_bank_release( bank: *const std::ffi::c_void ) {
+    let bank = bank as *const Bank;
+    unsafe { Arc::decrement_strong_count(bank) };
+}
+
+#[no_mangle]
+pub extern "C" fn fd_ext_bank_release_thunks( load_and_execute_output: *mut std::ffi::c_void ) {
+    let load_and_execute_output: Box<LoadAndExecuteTransactionsOutput> = unsafe { Box::from_raw( load_and_execute_output as *mut LoadAndExecuteTransactionsOutput ) };
+    drop(load_and_execute_output);
+}
+
 /// params to `verify_accounts_hash`
 struct VerifyAccountsHashConfig {
     test_hash_calculation: bool,
@@ -278,7 +342,7 @@ impl AddAssign for SquashTiming {
 }
 
 #[derive(Debug, Default, PartialEq)]
-pub(crate) struct CollectorFeeDetails {
+pub struct CollectorFeeDetails {
     transaction_fee: u64,
     priority_fee: u64,
 }
@@ -529,6 +593,7 @@ impl PartialEq for Bank {
             transaction_count,
             non_vote_transaction_count_since_restart: _,
             transaction_error_count: _,
+            non_vote_transaction_error_count: _,
             transaction_entries_count: _,
             transactions_per_entry_max: _,
             tick_height,
@@ -774,6 +839,9 @@ pub struct Bank {
     /// The number of transaction errors in this slot
     transaction_error_count: AtomicU64,
 
+    /// The number of non-vote transaction errors since boot
+    non_vote_transaction_error_count: AtomicU64,
+
     /// The number of transaction entries in this slot
     transaction_entries_count: AtomicU64,
 
@@ -822,7 +890,7 @@ pub struct Bank {
     collector_id: Pubkey,
 
     /// Fees that have been collected
-    collector_fees: AtomicU64,
+    pub collector_fees: AtomicU64,
 
     /// Track cluster signature throughput and adjust fee rate
     pub(crate) fee_rate_governor: FeeRateGovernor,
@@ -901,7 +969,7 @@ pub struct Bank {
     check_program_modification_slot: bool,
 
     /// Collected fee details
-    collector_fee_details: RwLock<CollectorFeeDetails>,
+    pub collector_fee_details: RwLock<CollectorFeeDetails>,
 
     /// The compute budget to use for transaction execution.
     compute_budget: Option<ComputeBudget>,
@@ -993,6 +1061,7 @@ pub struct ProcessedTransactionCounts {
     pub processed_transactions_count: u64,
     pub processed_non_vote_transactions_count: u64,
     pub processed_with_successful_result_count: u64,
+    pub processed_non_vote_with_successful_result_count: u64,
     pub signature_count: u64,
 }
 
@@ -1011,6 +1080,7 @@ impl Bank {
             transaction_count: AtomicU64::default(),
             non_vote_transaction_count_since_restart: AtomicU64::default(),
             transaction_error_count: AtomicU64::default(),
+            non_vote_transaction_error_count: AtomicU64::default(),
             transaction_entries_count: AtomicU64::default(),
             transactions_per_entry_max: AtomicU64::default(),
             tick_height: AtomicU64::default(),
@@ -1270,6 +1340,7 @@ impl Bank {
                 parent.non_vote_transaction_count_since_restart(),
             ),
             transaction_error_count: AtomicU64::new(0),
+            non_vote_transaction_error_count: AtomicU64::new(0),
             transaction_entries_count: AtomicU64::new(0),
             transactions_per_entry_max: AtomicU64::new(0),
             // we will .clone_with_epoch() this soon after stake data update; so just .clone() for now
@@ -1645,6 +1716,7 @@ impl Bank {
             transaction_count: AtomicU64::new(fields.transaction_count),
             non_vote_transaction_count_since_restart: AtomicU64::default(),
             transaction_error_count: AtomicU64::default(),
+            non_vote_transaction_error_count: AtomicU64::default(),
             transaction_entries_count: AtomicU64::default(),
             transactions_per_entry_max: AtomicU64::default(),
             tick_height: AtomicU64::new(fields.tick_height),
@@ -3257,6 +3329,13 @@ impl Bank {
         sanitized_txs: &[SanitizedTransaction],
         processing_results: &[TransactionProcessingResult],
     ) {
+        // FIREDANCER: don't insert anything into the status cache if it's disabled for
+        // benchmarking reasons.
+        extern "C" {
+            fn fd_ext_disable_status_cache() -> i32;
+        }
+        if unsafe { fd_ext_disable_status_cache() } != 0 { return; }
+
         let mut status_cache = self.status_cache.write().unwrap();
         assert_eq!(sanitized_txs.len(), processing_results.len());
         for (tx, processing_result) in sanitized_txs.iter().zip(processing_results) {
@@ -3736,6 +3815,9 @@ impl Bank {
             match processing_result.flattened_result() {
                 Ok(()) => {
                     processed_counts.processed_with_successful_result_count += 1;
+                    if !tx.is_simple_vote_transaction() {
+                        processed_counts.processed_non_vote_with_successful_result_count += 1;
+                    }
                 }
                 Err(err) => {
                     if *err_count == 0 {
@@ -3960,6 +4042,7 @@ impl Bank {
             processed_transactions_count,
             processed_non_vote_transactions_count,
             processed_with_successful_result_count,
+            processed_non_vote_with_successful_result_count,
             signature_count,
         } = *processed_counts;
 
@@ -3973,6 +4056,11 @@ impl Bank {
             processed_transactions_count.saturating_sub(processed_with_successful_result_count);
         self.transaction_error_count
             .fetch_add(processed_with_failure_result_count, Relaxed);
+
+        let processed_non_vote_with_failure_result_count =
+            processed_non_vote_transactions_count.saturating_sub(processed_non_vote_with_successful_result_count);
+        self.non_vote_transaction_error_count
+            .fetch_add(processed_non_vote_with_failure_result_count, Relaxed);
 
         if processed_transactions_count > 0 {
             self.is_delta.store(true, Relaxed);
@@ -4046,6 +4134,8 @@ impl Bank {
         if self.feature_set.is_active(&reward_full_priority_fee::id()) {
             self.filter_program_errors_and_collect_fee_details(&processing_results)
         } else {
+            // FIREDANCER: GUI needs the full fee details to be filled in.
+            let _ = self.filter_program_errors_and_collect_fee_details(&processing_results);
             self.filter_program_errors_and_collect_fee(&processing_results)
         };
 
@@ -5357,6 +5447,10 @@ impl Bank {
 
     pub fn transaction_error_count(&self) -> u64 {
         self.transaction_error_count.load(Relaxed)
+    }
+
+    pub fn non_vote_transaction_error_count(&self) -> u64 {
+        self.non_vote_transaction_error_count.load(Relaxed)
     }
 
     pub fn transaction_entries_count(&self) -> u64 {

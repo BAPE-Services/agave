@@ -147,7 +147,10 @@ const MIN_NUM_STAKED_NODES: usize = 500;
 // Must have at least one socket to monitor the TVU port
 // The unsafes are safe because we're using fixed, known non-zero values
 pub const MINIMUM_NUM_TVU_SOCKETS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1) };
-pub const DEFAULT_NUM_TVU_SOCKETS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(8) };
+// FIREDANCER: Firedancer handles TVU ingress, so the sockets
+// Agave opens are unused.  Just open 1 to prevent an error
+// message if Agave affinity is not at least 8 cores.
+pub const DEFAULT_NUM_TVU_SOCKETS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1) };
 
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum ClusterInfoError {
@@ -2718,6 +2721,42 @@ impl ClusterInfo {
         Ok(())
     }
 
+    /// FIREDANCER: Constants for sending cluster nodes over IPC
+    const FIREDANCER_CLUSTER_NODE_CNT: u64 = 200*201 - 1; /* -1 because it doesn't include itself */
+    const FIREDANCER_CLUSTER_NODE_SZ: u64 = 8 + Self::FIREDANCER_CLUSTER_NODE_CNT * 38;
+
+    /// FIREDANCER: Publish current gossiped cluster contact information to Firedancer
+    unsafe fn firedancer_send_cluster_nodes(&self) {
+        let peers = self.tvu_peers();
+        if peers.len() > Self::FIREDANCER_CLUSTER_NODE_CNT as usize {
+            warn!("cluster_nodes len {} exceeds max_elements {}", peers.len(), Self::FIREDANCER_CLUSTER_NODE_CNT);
+        }
+
+        let len = usize::min(Self::FIREDANCER_CLUSTER_NODE_CNT as usize, peers.len());
+
+        let mut memory: [u8; Self::FIREDANCER_CLUSTER_NODE_SZ as usize] = [0; Self::FIREDANCER_CLUSTER_NODE_SZ as usize];
+        memory[0..8].copy_from_slice(&len.to_le_bytes());
+
+        for (i, node) in peers.iter().enumerate().take(len) {
+            let pubkey_bytes = node.pubkey().to_bytes();
+            let (ip, port) = if let Ok(SocketAddr::V4(addr)) = node.tvu(solana_client::connection_cache::Protocol::UDP) {
+                (addr.ip().octets(), addr.port())
+            } else {
+                ([0; 4], 0)
+             };
+
+            let offset = 8 + i * 38;
+            memory[offset..offset+32].copy_from_slice(&pubkey_bytes);
+            memory[offset+32..offset+36].copy_from_slice(&ip);
+            memory[offset+36..offset+38].copy_from_slice(&port.to_le_bytes());
+        }
+
+        extern "C" {
+            fn fd_ext_poh_publish_cluster_info(data: *const u8, len: u64);
+        }
+        fd_ext_poh_publish_cluster_info(memory.as_ptr(), 8 + len as u64 * 38);
+    }
+
     pub(crate) fn start_socket_consume_thread(
         self: Arc<Self>,
         receiver: PacketBatchReceiver,
@@ -2753,6 +2792,8 @@ impl ClusterInfo {
         response_sender: PacketBatchSender,
         should_check_duplicate_instance: bool,
         exit: Arc<AtomicBool>,
+        // FIREDANCER: If this gossip service should send updates to Firedancer
+        send_firedancer: bool,
     ) -> JoinHandle<()> {
         let mut last_print = Instant::now();
         let recycler = PacketBatchRecycler::default();
@@ -2764,6 +2805,9 @@ impl ClusterInfo {
         Builder::new()
             .name("solGossipListen".to_string())
             .spawn(move || {
+                // FIREDANCER: We should send a cluster node contact update immediately
+                let mut last_update = Instant::now() - Duration::from_secs(5);
+
                 while !exit.load(Ordering::Relaxed) {
                     if let Err(err) = self.run_listen(
                         &recycler,
@@ -2795,6 +2839,14 @@ impl ClusterInfo {
                                 std::process::exit(1);
                             }
                             _ => error!("gossip run_listen failed: {}", err),
+                        }
+                    }
+
+                    // FIREDANCER: Send the cluster contact info over the IPC boundary to Firedancer
+                    if send_firedancer {
+                        if last_update.elapsed() > Duration::from_secs(5) {
+                            unsafe { self.firedancer_send_cluster_nodes() };
+                            last_update = Instant::now();
                         }
                     }
                 }
@@ -3152,24 +3204,33 @@ impl Node {
         }
     }
 
-    pub fn new_with_external_ip(pubkey: &Pubkey, config: NodeConfig) -> Node {
+    pub fn new_with_external_ip(
+        pubkey: &Pubkey,
+        config: NodeConfig,
+        // FIREDANCER: The desired TPU port is passed in from the config.toml file
+        // so that it can be configured.
+        firedancer_tpu_port: u16,
+        // FIREDANCER: The desired TVU port is passed in from the config.toml file
+        // so that it can be configured.
+        firedancer_tvu_port: u16,
+    ) -> Node {
         let NodeConfig {
             gossip_addr,
             port_range,
             bind_ip_addr,
             public_tpu_addr,
             public_tpu_forwards_addr,
-            num_tvu_sockets,
+            num_tvu_sockets: _,
             num_quic_endpoints,
         } = config;
 
         let (gossip_port, (gossip, ip_echo)) =
             Self::get_gossip_port(&gossip_addr, port_range, bind_ip_addr);
 
-        let (tvu_port, tvu_sockets) =
-            multi_bind_in_range(bind_ip_addr, port_range, num_tvu_sockets.get())
-                .expect("tvu multi_bind");
-        let (tvu_quic_port, tvu_quic) = Self::bind(bind_ip_addr, port_range);
+        // FIREDANCER: Correct TVU port is managed by Firedancer, so this is unused.
+        let (_tvu_port, tvu_sockets) =
+            multi_bind_in_range(bind_ip_addr, port_range, 8).expect("tvu multi_bind");
+        let (_tvu_quic_port, tvu_quic) = Self::bind(bind_ip_addr, port_range);
         let (tpu_port, tpu_sockets) =
             multi_bind_in_range(bind_ip_addr, port_range, 32).expect("tpu multi_bind");
 
@@ -3200,7 +3261,8 @@ impl Node {
         )
         .unwrap();
 
-        let (tpu_vote_port, tpu_vote_sockets) =
+        // FIREDANCER: Correct TPU vote port is managed by Firedancer, so this is unused.
+        let (_tpu_vote_port, tpu_vote_sockets) =
             multi_bind_in_range(bind_ip_addr, port_range, 1).expect("tpu_vote multi_bind");
 
         let (_, retransmit_sockets) =
@@ -3224,15 +3286,27 @@ impl Node {
         );
         let addr = gossip_addr.ip();
         info.set_gossip((addr, gossip_port)).unwrap();
-        info.set_tvu((addr, tvu_port)).unwrap();
-        info.set_tvu_quic((addr, tvu_quic_port)).unwrap();
-        info.set_tpu(public_tpu_addr.unwrap_or_else(|| SocketAddr::new(addr, tpu_port)))
+        // FIREDANCER: The port we receive shreds on is determined by the Firedancer config,
+        // not whatever port Solana Labs manages to bind.
+        info.set_tvu((addr, firedancer_tvu_port)).unwrap();
+        info.set_tvu_quic((addr, firedancer_tvu_port)).unwrap();
+        // FIREDANCER: The port we receive transactions on is determined by the Firedancer config,
+        // not whatever port Solana Labs manages to bind.
+        // info.set_tpu(public_tpu_addr.unwrap_or_else(|| SocketAddr::new(addr, tpu_port)))
+        //     .unwrap();
+        // info.set_tpu_forwards(
+        //     public_tpu_forwards_addr.unwrap_or_else(|| SocketAddr::new(addr, tpu_forwards_port)),
+        // )
+        // .unwrap();
+        // info.set_tpu_vote((addr, tpu_vote_port)).unwrap();
+        info.set_tpu(public_tpu_addr.unwrap_or_else(|| SocketAddr::new(addr, firedancer_tpu_port)))
             .unwrap();
         info.set_tpu_forwards(
-            public_tpu_forwards_addr.unwrap_or_else(|| SocketAddr::new(addr, tpu_forwards_port)),
+            public_tpu_forwards_addr.unwrap_or_else(|| SocketAddr::new(addr, firedancer_tpu_port)),
         )
         .unwrap();
-        info.set_tpu_vote((addr, tpu_vote_port)).unwrap();
+        info.set_tpu_vote((addr, firedancer_tpu_port)).unwrap();
+
         info.set_serve_repair((addr, serve_repair_port)).unwrap();
         info.set_serve_repair_quic((addr, serve_repair_quic_port))
             .unwrap();

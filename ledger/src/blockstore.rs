@@ -300,6 +300,48 @@ impl SlotMetaWorkingSetEntry {
     }
 }
 
+/// FIREDANCER: Insert shreds received from the shred tile into the blockstore
+#[no_mangle]
+pub extern "C" fn fd_ext_blockstore_insert_shreds(blockstore: *const std::ffi::c_void, shred_cnt: u64, shred_bytes: *const u8, shred_sz: u64, stride: u64, is_trusted: i32) {
+    let blockstore = unsafe { &*(blockstore as *const Blockstore) };
+    let shred_bytes = unsafe { std::slice::from_raw_parts(shred_bytes, (stride * (shred_cnt - 1) + shred_sz) as usize) };
+    let shreds = (0..shred_cnt).map(|i| {
+        let shred: &[u8] = &shred_bytes[(stride*i) as usize..(stride*i+shred_sz) as usize];
+        Shred::new_from_serialized_shred(shred.to_vec()).unwrap()
+    }).collect();
+
+    /* The unwrap() here is not a mistake or laziness.  We do not
+       expect inserting shreds to fail, and cannot recover if it does.
+       Solana Labs panics if this happens and Firedancer will as well. */
+    blockstore.insert_shreds(shreds, None, is_trusted!=0).unwrap();
+}
+
+/// FIREDANCER: Create a new blockstore with block 0 filled with the provided
+/// shreds at the provided ledger path.  This is used to create a blockstore
+/// archive for the genesis block.
+#[no_mangle]
+pub extern "C" fn fd_ext_blockstore_create_block0(ledger_path: *const i8, shred_cnt: u64, shred_bytes: *const u8, shred_sz: u64, stride: u64) {
+    let ledger_path = Path::new(unsafe { std::ffi::CStr::from_ptr(ledger_path).to_str().unwrap() });
+    Blockstore::destroy(ledger_path).unwrap();
+    let blockstore = Blockstore::open_with_options(
+        ledger_path,
+        BlockstoreOptions {
+            access_type: AccessType::Primary,
+            recovery_mode: None,
+            enforce_ulimit_nofile: false,
+            column_options: LedgerColumnOptions::default(),
+        },
+    ).unwrap();
+
+    let shred_bytes = unsafe { std::slice::from_raw_parts(shred_bytes, (stride * (shred_cnt - 1) + shred_sz) as usize) };
+    let shreds = (0..shred_cnt).map(|i| {
+        let shred: &[u8] = &shred_bytes[(stride*i) as usize..(stride*i+shred_sz) as usize];
+        Shred::new_from_serialized_shred(shred.to_vec()).unwrap()
+    }).collect();
+    blockstore.insert_shreds(shreds, None, false).unwrap();
+    blockstore.set_roots(std::iter::once(&0)).unwrap();
+}
+
 pub fn banking_trace_path(path: &Path) -> PathBuf {
     path.join("banking_trace")
 }

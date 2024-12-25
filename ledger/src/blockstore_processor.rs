@@ -183,6 +183,11 @@ pub fn execute_batch(
     {
         check_block_cost_limits(bank, &commit_results, batch.sanitized_transactions())
     } else {
+        let _ = check_block_cost_limits(
+            bank,
+            &commit_results,
+            batch.sanitized_transactions(),
+        );
         Ok(())
     });
 
@@ -896,6 +901,8 @@ pub fn test_process_blockstore(
         None,
         None,
         exit,
+        // FIREDANCER: No need to communicate these leader schedules to Firedancer
+        false,
     )
     .unwrap();
 
